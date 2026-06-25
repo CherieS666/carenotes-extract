@@ -274,6 +274,24 @@
       <span class="hint" id="parseHint">Detects carer, client, date and shift time automatically — always confirm before adding.</span>
     </div>
 
+    <div id="multiShiftBlock" style="display:none;" class="divider">
+      <div style="font-size:13px; font-weight:600; margin-bottom:4px;">Found multiple shifts in this note</div>
+      <div class="hint" style="margin-bottom:12px;">Carer and client are shared across all shifts below — check them once, then review each date/time row before adding.</div>
+      <div class="row">
+        <div class="field"><label>Carer name</label><input id="ms_carer" /></div>
+        <div class="field"><label>Client name</label><input id="ms_client" /></div>
+      </div>
+      <table style="margin-top:14px;">
+        <thead><tr><th style="width:30px;"></th><th>Date</th><th>Start</th><th>End</th><th class="num">Total</th></tr></thead>
+        <tbody id="multiShiftRows"></tbody>
+      </table>
+      <div class="btnrow">
+        <button id="addAllShiftsBtn">Add selected shifts</button>
+        <button class="secondary" id="clearMultiBtn">Clear</button>
+        <span class="hint" id="multiHint"></span>
+      </div>
+    </div>
+
     <div id="fieldsBlock" style="display:none;" class="divider">
       <div class="row">
         <div class="field"><label>Carer name</label><input id="f_carer" /></div>
@@ -348,7 +366,6 @@ function extractDate(text){
   const isDob = c => /\bdob\b|date\s*of\s*birth/i.test(c.context);
   const isPreferred = c => /date\s*\/\s*time|shift\s*date|signature|rn\s*signature|date\s*:?\s*$/i.test(c.context);
 
-  // prefer: non-DOB + contextually preferred label, else first non-DOB date, else first date overall
   let pick = candidates.find(c => !isDob(c) && isPreferred(c))
     || candidates.find(c => !isDob(c))
     || candidates[0];
@@ -357,11 +374,64 @@ function extractDate(text){
   return `${y}-${pad(+mo)}-${pad(+d)}`;
 }
 
+// Separator between two time tokens is sometimes a normal dash, sometimes a mangled
+// character from an encoding mismatch upstream (e.g. "9:00\uFFFDV17:00"). Rather than trying
+// to recover the original character, tolerate any short run of non-digit, non-meridiem
+// characters as "probably a dash" between two HH:MM tokens.
+const TIME_TOKEN = '\\d{1,2}[:.]\\d{2}\\s*(?:am|pm)?';
+const TIME_RANGE_RE_GLOBAL = new RegExp(`(${TIME_TOKEN})\\s*[^\\dapm\\n]{1,4}\\s*(${TIME_TOKEN})`, 'gi');
+const TIME_RANGE_RE = new RegExp(`(${TIME_TOKEN})\\s*[^\\dapm\\n]{1,4}\\s*(${TIME_TOKEN})`, 'i');
+
 function extractTimeRange(text){
-  const rangeRe = /(\d{1,2}[:.]\d{2}\s*(?:am|pm)?)\s*[\-–—~to]+\s*(\d{1,2}[:.]\d{2}\s*(?:am|pm)?)/i;
-  const m = text.match(rangeRe);
+  const m = text.match(TIME_RANGE_RE);
   if(!m) return null;
   return { rawStart: m[1].trim(), rawEnd: m[2].trim() };
+}
+
+function extractTimeRangesAll(text){
+  const re = new RegExp(TIME_RANGE_RE_GLOBAL.source, 'gi');
+  const results = [];
+  let m;
+  while((m = re.exec(text)) !== null){
+    results.push({ rawStart: m[1].trim(), rawEnd: m[2].trim(), index: m.index });
+  }
+  return results;
+}
+
+function extractDatesAll(text){
+  const re = /(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{2,4})/g;
+  const results = [];
+  let m;
+  while((m = re.exec(text)) !== null){
+    let [, d, mo, y] = m;
+    if(y.length === 2) y = '20' + y;
+    const start = Math.max(0, m.index - 25);
+    const context = text.slice(start, m.index).toLowerCase();
+    if(/\bdob\b|date\s*of\s*birth/i.test(context)) continue; // skip DOB-labeled dates
+    results.push({ d:+d, mo:+mo, y:+y, index: m.index, raw: m[0] });
+  }
+  return results;
+}
+
+// Pairs each date with the nearest time-range that follows it (before the next date starts).
+// Used for multi-shift notes/emails that list several day entries in one block of text.
+function findShiftBlocks(text){
+  const dates = extractDatesAll(text);
+  const times = extractTimeRangesAll(text);
+  const blocks = [];
+  for(let i = 0; i < dates.length; i++){
+    const d = dates[i];
+    const nextDateIdx = (i + 1 < dates.length) ? dates[i+1].index : Infinity;
+    const t = times.find(tt => tt.index > d.index && tt.index < nextDateIdx);
+    if(t){
+      blocks.push({
+        dateStr: `${d.y}-${pad(d.mo)}-${pad(d.d)}`,
+        rawStart: t.rawStart,
+        rawEnd: t.rawEnd
+      });
+    }
+  }
+  return blocks;
 }
 
 function parseTimeToken(tok){
@@ -376,11 +446,9 @@ function parseTimeToken(tok){
   return { h, m, hadMeridiem: !!meridiem };
 }
 
-function extractCareTimes(text){
-  const range = extractTimeRange(text);
-  if(!range) return { start:'', end:'', ambiguous:false };
-  let s = parseTimeToken(range.rawStart);
-  let e = parseTimeToken(range.rawEnd);
+function resolveTimePair(rawStart, rawEnd){
+  let s = parseTimeToken(rawStart);
+  let e = parseTimeToken(rawEnd);
   let ambiguous = false;
   if(!s.hadMeridiem && !e.hadMeridiem){
     if(s.h < 12 && e.h < 12 && e.h < s.h){
@@ -391,9 +459,20 @@ function extractCareTimes(text){
   return { start: `${pad(s.h)}:${pad(s.m)}`, end: `${pad(e.h)}:${pad(e.m)}`, ambiguous };
 }
 
+function extractCareTimes(text){
+  const range = extractTimeRange(text);
+  if(!range) return { start:'', end:'', ambiguous:false };
+  return resolveTimePair(range.rawStart, range.rawEnd);
+}
+
 function extractClientName(text){
   let m = text.match(/Client\s*(?:Name)?\s*:\s*([^\n]+)/i);
   if(m) return cleanField(m[1]);
+  // common phrasing in forwarded emails: "Please find the caring notes for X"
+  m = text.match(/(?:caring|care)\s*notes?\s*for\s+([A-Za-z\u4e00-\u9fff\u00c0-\u017f]+(?:\s[A-Za-z\u4e00-\u9fff\u00c0-\u017f]+)?)/i);
+  if(m) return cleanField(m[1]);
+  // fallback: a short standalone line ending in a colon, used as a name header in
+  // some note formats — but this is a weak signal, so it's tried last
   m = text.match(/^([A-Za-z\u4e00-\u9fff\u00c0-\u017f]+(?:\s[A-Za-z\u4e00-\u9fff\u00c0-\u017f]+)?)\s*:\s*$/m);
   if(m) return cleanField(m[1]);
   return '';
@@ -403,6 +482,39 @@ function extractCarerName(text){
   let m = text.match(/(?:Staff Name|Carer|RN\s*Name)\s*:\s*([^\n]+)/i);
   if(m) return cleanField(m[1]);
   return '';
+}
+
+// ---- RN / clinical documentation path ----
+// These forms (e.g. "RN Clinical Documentation Sheet") don't list a shift start/end
+// range — they record a single procedure timestamp and have no shift duration in the
+// text at all. Detect them so the tool can skip guessing a time range it can't find,
+// and surface the right labels (RN Name, Client Name, procedure date/time) instead.
+function isRnClinicalDoc(text){
+  return /RN\s*Clinical\s*Documentation|Clinical\s*Documentation\s*Sheet|RN\s*Signature|Pump\s*Start(?:ed|-Up)?/i.test(text);
+}
+
+function extractRnClinicalFields(text){
+  const client = extractClientName(text);
+  let carer = extractCarerName(text); // covers "RN Name:" via the shared regex
+  if(!carer){
+    const m = text.match(/RN\s*Name\s*:\s*([^\n]+)/i);
+    if(m) carer = cleanField(m[1]);
+  }
+
+  // prefer the explicit procedure timestamp label if present, e.g.
+  // "Date / Time Pump Started: 29/05/2026@1100hrs"
+  let date = '', startTime = '';
+  const dtMatch = text.match(/Date\s*\/\s*Time[^:]*:\s*_*(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{4})\s*@?\s*(\d{1,4})\s*hrs?/i);
+  if(dtMatch){
+    const [, d, mo, y, hhmm] = dtMatch;
+    date = `${y}-${pad(+mo)}-${pad(+d)}`;
+    const digits = hhmm.padStart(4, '0');
+    startTime = `${digits.slice(0,2)}:${digits.slice(2,4)}`;
+  } else {
+    date = extractDate(text);
+  }
+
+  return { carer, client, date, start: startTime, end: '' };
 }
 
 function classifyHours(startStr, endStr){
@@ -444,31 +556,133 @@ function classifyHours(startStr, endStr){
 // ---- UI wiring ----
 const rawnote = document.getElementById('rawnote');
 const fieldsBlock = document.getElementById('fieldsBlock');
+const multiShiftBlock = document.getElementById('multiShiftBlock');
 const bucketPreview = document.getElementById('bucketPreview');
 const addRow = document.getElementById('addRow');
 const parseHint = document.getElementById('parseHint');
+let multiShiftRows = []; // working set for the multi-shift review table
 
 document.getElementById('parseBtn').onclick = () => {
   const text = rawnote.value;
   if(!text.trim()) return;
-  const date = extractDate(text);
-  const times = extractCareTimes(text);
+
+  // reset both review surfaces before deciding which one to show
+  fieldsBlock.style.display = 'none';
+  multiShiftBlock.style.display = 'none';
+
+  if(isRnClinicalDoc(text)){
+    renderSingleShiftFields(extractRnClinicalFields(text), {
+      forcedHint: 'Clinical documentation detected — this form has no shift end time in the text. Start time was read from the procedure timestamp; enter the end time manually.'
+    });
+    return;
+  }
+
+  const blocks = findShiftBlocks(text);
+  if(blocks.length > 1){
+    renderMultiShiftReview(text, blocks);
+    return;
+  }
+
+  // single shift (or zero detected — still show fields for manual entry)
+  const date = blocks.length === 1 ? blocks[0].dateStr : extractDate(text);
+  const times = blocks.length === 1 ? resolveTimePair(blocks[0].rawStart, blocks[0].rawEnd) : extractCareTimes(text);
   const client = extractClientName(text);
   const carer = extractCarerName(text);
+  renderSingleShiftFields({ carer, client, date, start: times.start, end: times.end, ambiguous: times.ambiguous });
+};
 
-  document.getElementById('f_carer').value = carer;
-  document.getElementById('f_client').value = client;
-  document.getElementById('f_date').value = date;
-  document.getElementById('f_start').value = times.start;
-  document.getElementById('f_end').value = times.end;
+function renderSingleShiftFields(data, opts){
+  opts = opts || {};
+  document.getElementById('f_carer').value = data.carer || '';
+  document.getElementById('f_client').value = data.client || '';
+  document.getElementById('f_date').value = data.date || '';
+  document.getElementById('f_start').value = data.start || '';
+  document.getElementById('f_end').value = data.end || '';
 
   fieldsBlock.style.display = 'block';
   addRow.style.display = 'flex';
-  parseHint.textContent = times.ambiguous
-    ? 'Could not tell am/pm for this time range with confidence — check the start/end time below before adding.'
-    : 'Review the fields below, fix anything that looks off, then add to the timesheet.';
-  parseHint.classList.toggle('warn', times.ambiguous);
+  parseHint.textContent = opts.forcedHint
+    ? opts.forcedHint
+    : (data.ambiguous
+        ? 'Could not tell am/pm for this time range with confidence — check the start/end time below before adding.'
+        : 'Review the fields below, fix anything that looks off, then add to the timesheet.');
+  parseHint.classList.toggle('warn', !!opts.forcedHint || !!data.ambiguous);
   updateBucketPreview();
+}
+
+function renderMultiShiftReview(text, blocks){
+  const client = extractClientName(text);
+  const carer = extractCarerName(text);
+  document.getElementById('ms_carer').value = carer;
+  document.getElementById('ms_client').value = client;
+
+  multiShiftRows = blocks.map((b, i) => {
+    const t = resolveTimePair(b.rawStart, b.rawEnd);
+    return { id: 'ms_' + i, date: b.dateStr, start: t.start, end: t.end, ambiguous: t.ambiguous, checked: true };
+  });
+
+  renderMultiShiftTable();
+  multiShiftBlock.style.display = 'block';
+  document.getElementById('multiHint').textContent =
+    `Found ${multiShiftRows.length} shifts in this note — uncheck any you don't want, fix times if needed, then add.`;
+}
+
+function renderMultiShiftTable(){
+  const tbody = document.getElementById('multiShiftRows');
+  tbody.innerHTML = multiShiftRows.map(r => {
+    const b = (r.start && r.end) ? classifyHours(r.start, r.end) : null;
+    return `
+      <tr>
+        <td><input type="checkbox" ${r.checked ? 'checked' : ''} onchange="toggleMultiRow('${r.id}', this.checked)" /></td>
+        <td><input type="date" value="${r.date}" style="border:1px solid var(--line); border-radius:6px; padding:5px 7px; font-size:12.5px;" onchange="updateMultiRow('${r.id}','date',this.value)" /></td>
+        <td><input type="time" value="${r.start}" style="border:1px solid var(--line); border-radius:6px; padding:5px 7px; font-size:12.5px;" onchange="updateMultiRow('${r.id}','start',this.value)" /></td>
+        <td><input type="time" value="${r.end}" style="border:1px solid var(--line); border-radius:6px; padding:5px 7px; font-size:12.5px;" onchange="updateMultiRow('${r.id}','end',this.value)" /></td>
+        <td class="num">${b ? b.total + 'h' : '—'}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function toggleMultiRow(id, checked){
+  const row = multiShiftRows.find(r => r.id === id);
+  if(row) row.checked = checked;
+}
+function updateMultiRow(id, field, value){
+  const row = multiShiftRows.find(r => r.id === id);
+  if(row){ row[field] = value; renderMultiShiftTable(); }
+}
+window.toggleMultiRow = toggleMultiRow;
+window.updateMultiRow = updateMultiRow;
+
+document.getElementById('addAllShiftsBtn').onclick = async () => {
+  const carer = document.getElementById('ms_carer').value.trim();
+  const client = document.getElementById('ms_client').value.trim();
+  if(!carer || !client){
+    alert('Please fill in carer and client name before adding.');
+    return;
+  }
+  const selected = multiShiftRows.filter(r => r.checked && r.date && r.start && r.end);
+  if(selected.length === 0){
+    alert('No complete shifts selected — check at least one row with a date, start and end time.');
+    return;
+  }
+  for(const r of selected){
+    const buckets = classifyHours(r.start, r.end);
+    entries.push({
+      id: 'e_' + Date.now() + '_' + Math.random().toString(36).slice(2,7),
+      carer, client, date: r.date, start: r.start, end: r.end,
+      morning: buckets.morning, afternoon: buckets.afternoon, night: buckets.night, total: buckets.total
+    });
+  }
+  await saveEntries();
+  renderEntries();
+  document.getElementById('clearMultiBtn').click();
+};
+
+document.getElementById('clearMultiBtn').onclick = () => {
+  rawnote.value = '';
+  multiShiftBlock.style.display = 'none';
+  multiShiftRows = [];
 };
 
 ['f_start','f_end'].forEach(id => {
