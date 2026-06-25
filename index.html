@@ -326,13 +326,35 @@ function timeToMinutes(t){ const [h,m] = t.split(':').map(Number); return h*60+m
 function minutesToHHMM(mins){ mins = ((mins % 1440)+1440)%1440; return pad(Math.floor(mins/60))+':'+pad(mins%60); }
 
 // ---- parsing helpers ----
+function cleanField(raw){
+  if(!raw) return '';
+  // strip underscores used as fill-in-the-blank lines, then surrounding whitespace
+  return raw.replace(/_+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+}
+
 function extractDate(text){
-  let m = text.match(/(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{4})/);
-  if(m){
-    const [, d, mo, y] = m;
-    return `${y}-${pad(+mo)}-${pad(+d)}`;
+  // collect every date match with its surrounding context, so we can avoid DOB
+  // and prefer a date near contextual labels like "Date/Time", "Shift Date", or a signature line
+  const dateRe = /(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{4})/g;
+  const candidates = [];
+  let m;
+  while((m = dateRe.exec(text)) !== null){
+    const start = Math.max(0, m.index - 25);
+    const context = text.slice(start, m.index).toLowerCase();
+    candidates.push({ match: m, context, index: m.index });
   }
-  return '';
+  if(candidates.length === 0) return '';
+
+  const isDob = c => /\bdob\b|date\s*of\s*birth/i.test(c.context);
+  const isPreferred = c => /date\s*\/\s*time|shift\s*date|signature|rn\s*signature|date\s*:?\s*$/i.test(c.context);
+
+  // prefer: non-DOB + contextually preferred label, else first non-DOB date, else first date overall
+  let pick = candidates.find(c => !isDob(c) && isPreferred(c))
+    || candidates.find(c => !isDob(c))
+    || candidates[0];
+
+  const [, d, mo, y] = pick.match;
+  return `${y}-${pad(+mo)}-${pad(+d)}`;
 }
 
 function extractTimeRange(text){
@@ -371,15 +393,15 @@ function extractCareTimes(text){
 
 function extractClientName(text){
   let m = text.match(/Client\s*(?:Name)?\s*:\s*([^\n]+)/i);
-  if(m) return m[1].trim();
+  if(m) return cleanField(m[1]);
   m = text.match(/^([A-Za-z\u4e00-\u9fff\u00c0-\u017f]+(?:\s[A-Za-z\u4e00-\u9fff\u00c0-\u017f]+)?)\s*:\s*$/m);
-  if(m) return m[1].trim();
+  if(m) return cleanField(m[1]);
   return '';
 }
 
 function extractCarerName(text){
-  let m = text.match(/(?:Staff Name|Carer)\s*:\s*([^\n]+)/i);
-  if(m) return m[1].trim();
+  let m = text.match(/(?:Staff Name|Carer|RN\s*Name)\s*:\s*([^\n]+)/i);
+  if(m) return cleanField(m[1]);
   return '';
 }
 
